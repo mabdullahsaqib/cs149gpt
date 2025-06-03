@@ -26,14 +26,17 @@ inline void twoDimWrite(std::vector<float> &tensor, int &x, int &y, const int &s
 
 // Step #2: Implement Read/Write Accessors for a 4D Tensor
 inline float fourDimRead(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
-        const int &sizeX, const int &sizeY, const int &sizeZ) {
-    return 0.0;
+        const int &sizeX, const int &sizeY, const int &sizeZ) 
+{   // b: batch, h: head, N: sequence length, d: embeding deimnesion
+    return tensor[x * (sizeX * sizeY * sizeZ) + y * (sizeY * sizeZ) + z * (sizeZ) + b];
 }
 
 inline void fourDimWrite(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
-        const int &sizeX, const int &sizeY, const int &sizeZ, float &val) {
-    return; 
+        const int &sizeX, const int &sizeY, const int &sizeZ, float &val)
+{   // b: batch, h: head, N: sequence length, d: embeding deimnesion
+    tensor[x * (sizeX * sizeY * sizeZ) + y * (sizeY * sizeZ) + z * (sizeZ) + b] = val;
 }
+
 
 // DO NOT EDIT THIS FUNCTION //
 std::vector<float> formatTensor(torch::Tensor tensor) {
@@ -123,7 +126,55 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     */
     
     // -------- YOUR CODE HERE  -------- //
-    
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+
+            // Step 1: QK^T (store into QK_t)
+            for (int i = 0; i < N; i++) {
+                for (int j = 0; j < N; j++) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < d; k++) {
+                        float q = fourDimRead(Q, b, h, i, k, H, N, d);
+                        float k_val = fourDimRead(K, b, h, j, k, H, N, d);
+                        dot += q * k_val;
+                    }
+                    twoDimWrite(QK_t, i, j, N, dot);
+                }
+            }
+
+            // Step 2: Apply softmax on QK_t
+            for (int i = 0; i < N; i++) {
+                float row_sum = 0.0f;
+
+                // Compute exp
+                for (int j = 0; j < N; j++) {
+                    float val = exp(twoDimRead(QK_t, i, j, N));
+                    twoDimWrite(QK_t, i, j, N, val);
+                    row_sum += val;
+                }
+
+                // Normalize
+                for (int j = 0; j < N; j++) {
+                    float val = twoDimRead(QK_t, i, j, N) / row_sum;
+                    twoDimWrite(QK_t, i, j, N, val);
+                }
+            }
+
+            // Step 3: Compute O = P * V
+            for (int i = 0; i < N; i++) {
+                for (int k = 0; k < d; k++) {
+                    float sum = 0.0f;
+                    for (int j = 0; j < N; j++) {
+                        float p = twoDimRead(QK_t, i, j, N);
+                        float v = fourDimRead(V, b, h, j, k, H, N, d);
+                        sum += p * v;
+                    }
+                    fourDimWrite(O, b, h, i, k, H, N, d, sum);
+                }
+            }
+        }
+    }
+
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
@@ -153,7 +204,86 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
+    int tileSize = 32;
 
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+
+            // Step 1: Blocked Matrix Multiply for QK_T
+            for (int i0 = 0; i0 < N; i0 += tileSize) 
+            {
+                int i_max = std::min(i0 + tileSize, N);
+                for (int j0 = 0; j0 < N; j0 += tileSize) 
+                {
+                    int j_max = std::min(j0 + tileSize, N);
+                    for (int k0 = 0; k0 < d; k0 += tileSize)
+                     {
+                        int k_max = std::min(k0 + tileSize, d);
+
+                        for (int i = i0; i < i_max; i++) 
+                        {
+                            for (int j = j0; j < j_max; j++) 
+                            {
+                                float sum = twoDimRead(QK_t, i, j, N); // accumulate
+                                for (int k = k0; k < k_max; k++)
+                                {
+                                    float q = fourDimRead(Q, b, h, i, k, H, N, d);
+                                    float k_val = fourDimRead(K, b, h, j, k, H, N, d);
+                                    sum += q * k_val;
+                                }
+                                twoDimWrite(QK_t, i, j, N, sum);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 2: Softmax over rows
+            for (int i = 0; i < N; i++) {
+                float row_sum = 0.0f;
+                for (int j = 0; j < N; j++) 
+                {
+                    float val = exp(twoDimRead(QK_t, i, j, N));
+                    twoDimWrite(QK_t, i, j, N, val);
+                    row_sum += val;
+                }
+                for (int j = 0; j < N; j++) 
+                {
+                    float val = twoDimRead(QK_t, i, j, N) / row_sum;
+                    twoDimWrite(QK_t, i, j, N, val);
+                }
+            }
+
+            // Step 3: Blocked Matix Multiply for O = P * V
+            for (int i0 = 0; i0 < N; i0 += tileSize) 
+            {
+                int i_max = std::min(i0 + tileSize, N);
+                for (int k0 = 0; k0 < d; k0 += tileSize)
+                {
+                    int k_max = std::min(k0 + tileSize, d);
+                    for (int j0 = 0; j0 < N; j0 += tileSize) 
+                    {
+                        int j_max = std::min(j0 + tileSize, N);
+
+                        for (int i = i0; i < i_max; i++) 
+                        {
+                            for (int k = k0; k < k_max; k++) 
+                            {
+                                float sum = fourDimRead(O, b, h, i, k, H, N, d);
+                                for (int j = j0; j < j_max; j++) 
+                                {
+                                    float p = twoDimRead(QK_t, i, j, N);
+                                    float v = fourDimRead(V, b, h, j, k, H, N, d);
+                                    sum += p * v;
+                                }
+                                fourDimWrite(O, b, h, i, k, H, N, d, sum);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
@@ -188,18 +318,44 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     // -------- YOUR CODE HERE  -------- //
     // We give you a template of the first three loops for your convenience
     //loop over batch
-    for (int b = 0; b < B; b++){
+    #pragma omp parallel for collapse(3)
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < N; i++) {
 
-        //loop over heads
-        for (int h = 0; h < H; h++){
-            for (int i = 0; i < N ; i++){
+                std::vector<float> scores(N);
+                float max_score = -INFINITY;
+                float sum = 0.0f;
 
-		// YRow is moved inside so each OpenMP thread gets a local copy.
-                at::Tensor ORowTensor = temp.index({torch::indexing::Slice(omp_get_thread_num(), torch::indexing::None)});      
-                std::vector<float> ORow = formatTensor(ORowTensor);
-		//YOUR CODE HERE
+                // Step 1: Compute QK_T for row i
+                for (int j = 0; j < N; j++) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < d; k++) {
+                        dot += fourDimRead(Q, b, h, i, k, H, N, d) * fourDimRead(K, b, h, j, k, H, N, d);
+                    }
+                    scores[j] = dot;
+                    if (dot > max_score) max_score = dot;
+                }
+
+                // Step 2: Softmax
+                for (int j = 0; j < N; j++) {
+                    scores[j] = exp(scores[j] - max_score);
+                    sum += scores[j];
+                }
+                for (int j = 0; j < N; j++) {
+                    scores[j] /= sum;
+                }
+
+                // Step 3: Compute P × V
+                for (int k = 0; k < d; k++) {
+                    float out = 0.0f;
+                    for (int j = 0; j < N; j++) {
+                        out += scores[j] * fourDimRead(V, b, h, j, k, H, N, d);
+                    }
+                    fourDimWrite(O, b, h, i, k, H, N, d, out);
+                }
             }
-	}
+        }
     }
 	    
 	
@@ -248,6 +404,73 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     std::vector<float> lnew = formatTensor(LnewTensor);
 
     // -------- YOUR CODE HERE  -------- //
+
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+
+            for (int jBlock = 0; jBlock < N; jBlock += Bc) {
+                for (int iBlock = 0; iBlock < N; iBlock += Br) {
+
+                    // Compute Pij (exp(Q × K^T))
+                    for (int j = 0; j < std::min(Bc, N - jBlock); j++) 
+                    {
+                        int colIdx = jBlock + j;
+                        for (int i = 0; i < std::min(Br, N - iBlock); i++) 
+                        {
+                            int rowIdx = iBlock + i;
+
+                            float dot = 0.0f;
+                            for (int k = 0; k < d; k++) 
+                            {
+                                float q = fourDimRead(Q, b, h, rowIdx, k, H, N, d);
+                                float k_val = fourDimRead(K, b, h, colIdx, k, H, N, d);
+                                dot += q * k_val;
+                            }
+
+                            float expDot = exp(dot);
+                            twoDimWrite(Pij, i, j, Bc, expDot);
+                        }
+                    }
+
+                    // Compute softmax(Pij), then accumulate Pij * V
+                    for (int i = 0; i < std::min(Br, N - iBlock); i++) 
+                    {
+                        int actualRow = i + iBlock;
+                        float sumP = 0.0f;
+
+                        for (int j = 0; j < std::min(Bc, N - jBlock); j++) 
+                        {
+                            sumP += twoDimRead(Pij, i, j, Bc);
+                        }
+
+                        float l_old = l[actualRow];
+                        float l_new = l_old + sumP;
+
+                        for (int k = 0; k < d; k++) 
+                        {
+                            float acc = 0.0f;
+
+                            for (int j = 0; j < std::min(Bc, N - jBlock); j++) 
+                            {
+                                int colIdx = j + jBlock;
+                                float pij = twoDimRead(Pij, i, j, Bc);
+                                float v = fourDimRead(V, b, h, colIdx, k, H, N, d);
+                                acc += pij * v;
+                            }
+
+                            float o_prev = fourDimRead(O, b, h, actualRow, k, H, N, d);
+                            float o_next = (o_prev * l_old + acc) / l_new;
+                            fourDimWrite(O, b, h, actualRow, k, H, N, d, o_next);
+                        }
+
+                        l[actualRow] = l_new;
+                    }
+                }
+            }
+
+            std::fill(l.begin(), l.end(), 0.0f); // Reset normalization vector
+        }
+    }
 
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
